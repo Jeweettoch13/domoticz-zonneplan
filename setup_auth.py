@@ -1,334 +1,299 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Zonneplan Domoticz Plugin - Eenmalige authenticatie setup
-Voer dit script uit op je Raspberry Pi VOORDAT je de plugin start.
+Zonneplan Domoticz Plugin - eenmalige authenticatie setup
+Aangepast voor de OAuth 2.0 Authorization Code + PKCE-login.
 
 Gebruik:
-    python3 setup_auth.py
+    py setup_auth.py
 
-Het script slaat de tokens op in 'zonneplan_token.json' in dezelfde map.
-Kopieer dat bestand naar de plugin-map als je klaar bent.
+Het script slaat zonneplan_token.json op in dezelfde map.
+Kopieer/plaats dat bestand in de Domoticz-pluginmap indien nodig.
 
-IMAP (optioneel):
-    Als je IMAP instelt, klikt het script automatisch op de bevestigingslink
-    in je e-mail. Zonder IMAP wordt de handmatige stap gebruikt.
+De nieuwe Zonneplan-login stuurt een zescijferige code per e-mail.
+IMAP en het automatisch aanklikken van een link zijn niet meer nodig.
 """
 
-import urllib.request
-import urllib.parse
+import base64
+import hashlib
 import json
 import os
+import secrets
+import sys
 import time
-import imaplib
-import email
-import re
-import getpass
-from html.parser import HTMLParser
+import urllib.error
+import urllib.request
 
 BASE_URL = "https://app-api.zonneplan.nl"
-TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zonneplan_token.json")
+TOKEN_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "zonneplan_token.json",
+)
+
+APP_VERSION = "5.10.1"
+INTEGRATION_VERSION = "domoticz-zonneplan/1.0.0"
 
 HEADERS = {
     "Content-Type": "application/json;charset=utf-8",
-    "x-app-version": "5.10.1",
+    "Accept": "application/json",
+    "x-app-version": APP_VERSION,
     "x-app-environment": "production",
-    "x-ha-integration": "domoticz-zonneplan/1.0.0",
-    "User-Agent": "domoticz-zonneplan/1.0.0",
+    "x-ha-integration": INTEGRATION_VERSION,
+    "User-Agent": INTEGRATION_VERSION,
 }
 
 
-# ------------------------------------------------------------------
-# HTTP helpers
-# ------------------------------------------------------------------
+class ApiError(Exception):
+    """API-fout met HTTP-status en eventueel antwoord van de server."""
 
-def post(path, data):
-    url = BASE_URL + path
-    body = json.dumps(data).encode("utf-8")
-    req = urllib.request.Request(url, data=body, headers=HEADERS, method="POST")
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    def __init__(self, status, message, body=None):
+        super().__init__(message)
+        self.status = status
+        self.body = body
 
 
-def get(path):
-    url = BASE_URL + path
-    req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-def http_get_url(url):
-    """Bezoek een willekeurige URL (voor het klikken op de bevestigingslink)."""
-    req = urllib.request.Request(url, headers={"User-Agent": "domoticz-zonneplan/1.0.0"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return resp.status
-
-
-# ------------------------------------------------------------------
-# IMAP helpers
-# ------------------------------------------------------------------
-
-class _LinkFinder(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.links = []
-
-    def handle_starttag(self, tag, attrs):
-        if tag.lower() == "a":
-            for k, v in attrs:
-                if k.lower() == "href" and v:
-                    self.links.append(v)
-
-
-def _find_zonneplan_link_in_mailbox(imap_server, email_addr, email_password, max_messages=30):
-    """
-    Verbindt via IMAP, scant de laatste e-mails en geeft de
-    eerste link terug die 'mijn.zonneplan' bevat. Geeft None
-    terug als er geen link gevonden wordt.
-    """
+def _decode_json(raw):
+    if not raw:
+        return {}
     try:
-        mail = imaplib.IMAP4_SSL(imap_server)
-        mail.login(email_addr, email_password)
-        mail.select("INBOX")
-
-        status, data = mail.search(None, "ALL")
-        if status != "OK" or not data[0]:
-            mail.logout()
-            return None
-
-        mail_ids = data[0].split()
-        to_check = sorted(mail_ids[-max_messages:], reverse=True)  # nieuwste eerst
-
-        for mid in to_check:
-            try:
-                status, fetched = mail.fetch(mid, "(BODY.PEEK[])")
-                if status != "OK" or not fetched or not fetched[0]:
-                    continue
-
-                msg = email.message_from_bytes(fetched[0][1])
-                plain_parts, html_parts = [], []
-
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        payload = part.get_payload(decode=True)
-                        if not payload:
-                            continue
-                        charset = part.get_content_charset() or "utf-8"
-                        txt = payload.decode(charset, errors="replace")
-                        if part.get_content_type() == "text/plain":
-                            plain_parts.append(txt)
-                        elif part.get_content_type() == "text/html":
-                            html_parts.append(txt)
-                else:
-                    payload = msg.get_payload(decode=True)
-                    if payload:
-                        charset = msg.get_content_charset() or "utf-8"
-                        plain_parts.append(payload.decode(charset, errors="replace"))
-
-                full_plain = "\n".join(plain_parts)
-                full_html  = "\n".join(html_parts)
-
-                # Verzamel links uit HTML en plain text
-                links = []
-                if full_html:
-                    parser = _LinkFinder()
-                    parser.feed(full_html)
-                    links.extend(parser.links)
-                links.extend(re.findall(r"https?://[^\s\"'<>]+", full_plain))
-                links.extend(re.findall(r"https?://[^\s\"'<>]+", full_html))
-
-                for link in links:
-                    if "mijn.zonneplan" in link.lower():
-                        mail.logout()
-                        return link
-            except Exception:
-                continue
-
-        mail.logout()
-        return None
-
-    except Exception as e:
-        print(f"  IMAP fout: {e}")
-        return None
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {"raw_response": raw.decode("utf-8", errors="replace")}
 
 
-def wait_for_confirmation_link_imap(imap_server, email_addr, email_password,
-                                     max_wait=180, poll_interval=5):
-    """
-    Polt de mailbox totdat een Zonneplan-bevestigingslink gevonden wordt,
-    bezoekt de link automatisch en geeft True terug bij succes.
-    """
-    print(f"  Wachten op bevestigingsmail (max {max_wait}s)...")
-    start = time.time()
-    while time.time() - start < max_wait:
-        link = _find_zonneplan_link_in_mailbox(imap_server, email_addr, email_password)
-        if link:
-            print(f"  Bevestigingslink gevonden, wordt automatisch geklikt...")
-            try:
-                status = http_get_url(link)
-                print(f"  Link bezocht (HTTP {status}).")
-                return True
-            except Exception as e:
-                print(f"  Kon link niet bezoeken: {e} — probeer handmatig.")
-                return False
-        time.sleep(poll_interval)
+def request_json(method, path, payload=None, expected_statuses=()):
+    """Voer een JSON API-aanvraag uit en geef (status, JSON) terug."""
+    url = BASE_URL + path
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers=HEADERS,
+        method=method,
+    )
 
-    print("  Geen bevestigingslink gevonden binnen de wachttijd.")
-    return False
-
-
-# ------------------------------------------------------------------
-# IMAP configuratie ophalen
-# ------------------------------------------------------------------
-
-def ask_imap_config(email_addr):
-    """
-    Vraag de gebruiker of IMAP gebruikt moet worden.
-    Geeft (imap_server, email_password) terug, of (None, None) als IMAP overgeslagen wordt.
-    """
-    print("\n--- IMAP (optioneel) ---")
-    print("Met IMAP klikt het script automatisch op de bevestigingslink.")
-    print("Zonder IMAP doe je dat handmatig.")
-    keuze = input("IMAP gebruiken? [j/N]: ").strip().lower()
-    if keuze not in ("j", "ja", "y", "yes"):
-        return None, None
-
-    # Raad IMAP-server op basis van domein
-    domain = email_addr.split("@")[-1].lower()
-    defaults = {
-        "gmail.com":      "imap.gmail.com",
-        "googlemail.com": "imap.gmail.com",
-        "outlook.com":    "imap-mail.outlook.com",
-        "hotmail.com":    "imap-mail.outlook.com",
-        "live.com":       "imap-mail.outlook.com",
-        "yahoo.com":      "imap.mail.yahoo.com",
-        "icloud.com":     "imap.mail.me.com",
-        "me.com":         "imap.mail.me.com",
-    }
-    default_server = defaults.get(domain, "")
-    prompt = f"IMAP server [{default_server}]: " if default_server else "IMAP server: "
-    imap_server = input(prompt).strip() or default_server
-
-    if not imap_server:
-        print("Geen IMAP server opgegeven, handmatige modus wordt gebruikt.")
-        return None, None
-
-    print(f"E-mailwachtwoord voor {email_addr}")
-    if "gmail" in imap_server:
-        print("  (Gmail: gebruik een App Password via myaccount.google.com/apppasswords)")
-    email_password = getpass.getpass("Wachtwoord: ")
-
-    # Test de verbinding
-    print("  IMAP verbinding testen...")
     try:
-        mail = imaplib.IMAP4_SSL(imap_server)
-        mail.login(email_addr, email_password)
-        mail.logout()
-        print("  IMAP verbinding geslaagd.")
-        return imap_server, email_password
-    except Exception as e:
-        print(f"  IMAP verbinding mislukt: {e}")
-        print("  Handmatige modus wordt gebruikt.")
-        return None, None
+        with urllib.request.urlopen(req, timeout=30) as response:
+            status = response.status
+            body = _decode_json(response.read())
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        body = _decode_json(raw)
+        if exc.code in expected_statuses:
+            return exc.code, body
+        detail = body.get("message") or body.get("error") or str(body)
+        raise ApiError(exc.code, f"HTTP {exc.code}: {detail}", body) from exc
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        raise ApiError(None, f"Netwerkfout bij {url}: {reason}") from exc
+    except TimeoutError as exc:
+        raise ApiError(None, f"Time-out bij {url}") from exc
+
+    if status not in expected_statuses and not (200 <= status < 300):
+        raise ApiError(status, f"HTTP {status}", body)
+    return status, body
 
 
-# ------------------------------------------------------------------
-# Hoofd authenticatieflow
-# ------------------------------------------------------------------
+def generate_pkce_pair():
+    """Genereer een verse PKCE-verifier en bijbehorende S256-challenge."""
+    verifier = secrets.token_urlsafe(96)[:128]
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return verifier, challenge
 
-def main():
-    print("=== Zonneplan Domoticz Plugin - Authenticatie Setup ===\n")
-    email_addr = input("Voer je Zonneplan e-mailadres in: ").strip()
 
-    # IMAP configuratie ophalen (optioneel)
-    imap_server, email_password = ask_imap_config(email_addr)
+def ask_nonempty(prompt, default=None):
+    if default:
+        answer = input(f"{prompt} [{default}]: ").strip()
+        return answer or default
+    while True:
+        answer = input(f"{prompt}: ").strip()
+        if answer:
+            return answer
+        print("Dit veld mag niet leeg zijn.")
 
-    # Stap 1: bevestigingsmail versturen
-    print(f"\nAanmeld-link wordt verstuurd naar {email_addr}...")
-    resp = post("/auth/request", {"email": email_addr})
-    uuid = resp.get("data", {}).get("uuid")
-    if not uuid:
-        print("Fout: kon geen UUID ophalen. Antwoord:", resp)
-        return
-    print(f"UUID ontvangen: {uuid}")
 
-    # Stap 2: bevestigingslink klikken (automatisch of handmatig)
-    if imap_server:
-        clicked = wait_for_confirmation_link_imap(imap_server, email_addr, email_password)
-        if not clicked:
-            print("Handmatige stap: klik zelf op de link in je e-mail.")
-            input("Druk op ENTER nadat je op de link hebt geklikt...\n")
-    else:
-        print("\nControleer je e-mail en klik op de aanmeldlink.")
-        input("Druk op ENTER nadat je op de link hebt geklikt...\n")
-
-    # Stap 3: wacht tot de backend het wachtwoord beschikbaar heeft
-    print("Eenmalig wachtwoord ophalen...")
-    otp = None
-    for attempt in range(20):
-        try:
-            resp = get(f"/auth/request/{uuid}")
-            auth_data = resp.get("data", {})
-            if auth_data.get("is_activated") and auth_data.get("password"):
-                otp = auth_data["password"]
-                print("Eenmalig wachtwoord verkregen.")
-                break
-            # Fallback voor oudere API-versies
-            if auth_data.get("one_time_password"):
-                otp = auth_data["one_time_password"]
-                print("Eenmalig wachtwoord verkregen (legacy veld).")
-                break
-        except Exception:
-            pass
-        print(f"  Nog niet actief, nog eens proberen ({attempt + 1}/20)...")
-        time.sleep(5)
-    else:
-        print("Fout: kon geen eenmalig wachtwoord ophalen. Probeer opnieuw.")
-        return
-
-    # Stap 4: wissel wachtwoord in voor access token
-    print("Toegangstoken aanvragen...")
-    resp = post("/oauth/token", {
-        "grant_type": "one_time_password",
+def request_email_code(email_addr, source_name, verifier, challenge):
+    """Start de login. HTTP 403 met otp_required=true is hierbij normaal."""
+    payload = {
+        "response_type": "code",
         "email": email_addr,
-        "password": otp,
-    })
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "source_name": source_name[:255],
+    }
 
-    token_data = resp.get("data", resp)
-    if "access_token" not in token_data:
-        print("Fout: geen access_token ontvangen. Antwoord:", resp)
-        return
+    print("\nAanmeldcode aanvragen bij Zonneplan...")
+    status, response = request_json(
+        "POST",
+        "/oauth/authorize-challenge",
+        payload,
+        expected_statuses=(403,),
+    )
 
+    # De API gebruikt HTTP 403 als normale indicatie dat de e-mailcode nodig is.
+    if not response.get("otp_required") or not response.get("auth_session"):
+        detail = response.get("message") or response.get("error") or response
+        raise ApiError(
+            status,
+            "Zonneplan gaf geen geldige OTP-sessie terug: " + str(detail),
+            response,
+        )
+
+    print("Zonneplan heeft de aanmeldcode aangevraagd.")
+    print(f"Controleer de inbox van: {email_addr}")
+    print("Voer de zescijferige code uit de e-mail hieronder in.")
+    return response["auth_session"]
+
+
+def submit_code_and_get_tokens(auth_session, otp, verifier):
+    """Wissel de e-mailcode in voor een autorisatiecode en vervolgens tokens."""
+    _, response = request_json(
+        "POST",
+        "/oauth/authorize-challenge",
+        {"auth_session": auth_session, "otp": otp},
+    )
+
+    authorization_code = response.get("authorization_code")
+    if not authorization_code:
+        raise ApiError(
+            200,
+            "Zonneplan gaf geen authorization_code terug: " + str(response),
+            response,
+        )
+
+    print("E-mailcode geaccepteerd. Toegangstokens aanvragen...")
+    _, token_response = request_json(
+        "POST",
+        "/oauth/token",
+        {
+            "grant_type": "authorization_code",
+            "code": authorization_code,
+            "code_verifier": verifier,
+        },
+    )
+
+    # Sommige API-responses bevatten tokens direct; ondersteun ook een data-wrapper.
+    token_data = token_response.get("data", token_response)
+    if not isinstance(token_data, dict) or not token_data.get("access_token"):
+        raise ApiError(
+            200,
+            "Geen access_token ontvangen: " + str(token_response),
+            token_response,
+        )
+    return token_data
+
+
+def verify_token(access_token):
+    """Controleer het token en haal de accountverbindingen op."""
+    headers = dict(HEADERS)
+    headers["Authorization"] = f"Bearer {access_token}"
+    req = urllib.request.Request(BASE_URL + "/user-accounts/me", headers=headers)
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return _decode_json(response.read())
+    except urllib.error.HTTPError as exc:
+        raw = _decode_json(exc.read())
+        raise ApiError(
+            exc.code,
+            f"Token ontvangen, maar accountcontrole mislukte (HTTP {exc.code}): {raw}",
+            raw,
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise ApiError(
+            None,
+            f"Token ontvangen, maar accountcontrole mislukte door een netwerkfout: {exc}",
+        ) from exc
+
+
+def save_tokens(token_data, email_addr):
     token_data["email"] = email_addr
     token_data["obtained_at"] = time.time()
 
-    with open(TOKEN_FILE, "w") as f:
-        json.dump(token_data, f, indent=2)
+    # Schrijf eerst naar een tijdelijk bestand om een halfgeschreven JSON-bestand
+    # te voorkomen als het proces wordt onderbroken.
+    temp_file = TOKEN_FILE + ".tmp"
+    with open(temp_file, "w", encoding="utf-8") as handle:
+        json.dump(token_data, handle, indent=2)
+        handle.write("\n")
+    os.replace(temp_file, TOKEN_FILE)
 
-    print(f"\nTokens opgeslagen in: {TOKEN_FILE}")
 
-    # Verificatie
-    print("\nVerificatie: gebruikersaccount ophalen...")
+def main():
+    print("=== Zonneplan Domoticz Plugin - OAuth/PKCE setup ===\n")
+    print("Deze versie gebruikt de nieuwe login met een zescijferige e-mailcode.")
+    print("Je Gmail-wachtwoord of IMAP-appwachtwoord is hiervoor niet nodig.\n")
+
+    email_addr = ask_nonempty("E-mailadres van je Zonneplan-account")
+    instance_name = ask_nonempty(
+        "Herkenbare naam voor deze Domoticz-installatie",
+        "Domoticz Windows PC",
+    )
+    source_name = f"Domoticz Zonneplan {INTEGRATION_VERSION} - {instance_name}"
+
+    verifier, challenge = generate_pkce_pair()
+
     try:
-        req = urllib.request.Request(
-            BASE_URL + "/user-accounts/me",
-            headers={**HEADERS, "Authorization": f"Bearer {token_data['access_token']}"}
+        auth_session = request_email_code(
+            email_addr,
+            source_name,
+            verifier,
+            challenge,
         )
-        with urllib.request.urlopen(req, timeout=30) as r:
-            me = json.loads(r.read().decode())
-        connections = me.get("data", {}).get("connections", [])
-        print(f"Succesvol ingelogd! {len(connections)} verbinding(en) gevonden.")
-        for conn in connections:
-            for c in conn.get("contracts", []):
-                ctype = c.get("contract_type", "onbekend")
-                cuuid = c.get("uuid", "")
-                print(f"  - {ctype} ({cuuid[:16]}...)")
-    except Exception as e:
-        print(f"Waarschuwing: verificatie mislukt: {e}")
 
-    print(f"\nKopieer '{TOKEN_FILE}' naar je Domoticz plugin-map:")
-    print(f"  /home/pi/domoticz/plugins/Zonneplan/zonneplan_token.json")
-    print("\nSetup voltooid!")
+        otp = ask_nonempty("Zescijferige code uit de Zonneplan-e-mail")
+        otp = "".join(ch for ch in otp if ch.isdigit())
+        if len(otp) != 6:
+            print("Fout: de code moet uit precies 6 cijfers bestaan.")
+            return 1
+
+        token_data = submit_code_and_get_tokens(auth_session, otp, verifier)
+        token_data["email"] = email_addr
+        token_data["obtained_at"] = time.time()
+
+        print("Toegangstoken ontvangen. Account controleren...")
+        account = verify_token(token_data["access_token"])
+        account_data = account.get("data", account)
+        connections = account_data.get("connections", [])
+
+        save_tokens(token_data, email_addr)
+        print(f"\nTokens opgeslagen in:\n  {TOKEN_FILE}")
+        print(f"Accountcontrole geslaagd; {len(connections)} verbinding(en) gevonden.")
+
+        for connection in connections:
+            for contract in connection.get("contracts", []):
+                contract_type = contract.get("contract_type", "onbekend")
+                contract_uuid = contract.get("uuid", "")
+                print(f"  - {contract_type} ({contract_uuid[:16]}...)")
+
+        if not token_data.get("refresh_token"):
+            print(
+                "\nLET OP: de API heeft geen refresh_token teruggegeven. "
+                "Automatisch vernieuwen kan dan mogelijk niet werken."
+            )
+
+        print("\nAuthenticatie voltooid.")
+        print("Plaats zonneplan_token.json in de map van de Domoticz-plugin")
+        print("als dit script niet rechtstreeks in die map staat.")
+        return 0
+
+    except ApiError as exc:
+        print(f"\nFOUT: {exc}")
+        if exc.status == 400:
+            print("Controleer de ingevoerde code en probeer opnieuw een nieuwe code aan te vragen.")
+        elif exc.status == 401:
+            print("De aanmelding is geweigerd. Controleer je account en probeer opnieuw.")
+        elif exc.status == 404:
+            print("De server meldt dat het endpoint niet bestaat. Controleer of de API-flow nog actueel is.")
+        elif exc.status == 429:
+            print("Er zijn te veel aanvragen gedaan. Wacht even voordat je opnieuw probeert.")
+        print("\nEr is geen tokenbestand overschreven als de setup niet is voltooid.")
+        return 1
+    except KeyboardInterrupt:
+        print("\nAfgebroken door gebruiker.")
+        return 130
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
